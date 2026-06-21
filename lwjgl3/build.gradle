@@ -1,0 +1,42 @@
+plugins {
+    id 'org.jetbrains.kotlin.jvm'
+    id 'application'
+}
+
+dependencies {
+    implementation project(':core')
+    implementation "com.badlogicgames.gdx:gdx-backend-lwjgl3:$gdxVersion"
+    implementation "com.badlogicgames.gdx:gdx-platform:$gdxVersion:natives-desktop"
+}
+
+java {
+    sourceCompatibility = JavaVersion.VERSION_17
+    targetCompatibility = JavaVersion.VERSION_17
+}
+
+tasks.withType(org.jetbrains.kotlin.gradle.tasks.KotlinCompile).configureEach {
+    kotlinOptions {
+        jvmTarget = '17'
+    }
+}
+
+application {
+    mainClass = 'com.railtheway.lwjgl3.DesktopLauncherKt'
+}
+
+// Headless logic smoke test (no display needed).
+tasks.register('verify', JavaExec) {
+    group = 'verification'
+    description = 'Run the headless game-logic smoke test.'
+    mainClass = 'com.railtheway.lwjgl3.VerifyKt'
+    classpath = sourceSets.main.runtimeClasspath
+}
+
+// Allow headless smoke runs: pass -Dheadless=true via args if needed.
+run {
+    if (System.getProperty('os.name')?.toLowerCase()?.contains('mac')) {
+        // LWJGL3 on macOS needs the main thread.
+        jvmArgs += ['-XstartOnFirstThread']
+    }
+    setIgnoreExitValue(true)
+}

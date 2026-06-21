@@ -1,0 +1,31 @@
+plugins {
+    id 'org.jetbrains.kotlin.jvm'
+}
+
+dependencies {
+    implementation project(':core')
+    implementation "com.github.xpenatan.gdx-teavm:backend-teavm:$teavmBackendVersion"
+}
+
+java {
+    sourceCompatibility = JavaVersion.VERSION_17
+    targetCompatibility = JavaVersion.VERSION_17
+}
+
+tasks.withType(org.jetbrains.kotlin.gradle.tasks.KotlinCompile).configureEach {
+    kotlinOptions {
+        jvmTarget = '17'
+    }
+}
+
+// AOT-compile the game (JVM bytecode -> JavaScript/WebGL) into build/dist (index.html + js).
+// Runs headlessly; no browser required to build.
+tasks.register('buildJavaScript', JavaExec) {
+    group = 'build'
+    description = 'Compile the game to JavaScript/WebGL with TeaVM.'
+    dependsOn 'classes'
+    mainClass = 'com.railtheway.teavm.TeaVMBuilderKt'
+    classpath = sourceSets.main.runtimeClasspath
+    workingDir = projectDir
+    maxHeapSize = '3g'
+}
