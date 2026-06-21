@@ -1,587 +1,471 @@
-# LibGDX + GWT Architecture for a 2D Railway Puzzle Game
+# libGDX + Kotlin Architecture for a Railway Valley 2 Clone (Browser Game)
 
 ## Summary
 
-Target a strict split between `core` gameplay logic and `html` bootstrap only. Keep all simulation deterministic, allocation-light, and free of reflection/native dependencies so the same code runs unchanged on desktop test harnesses and GWT/WebGL 2 (`useGL30 = true`).
+RailTheWay is a 2D railway **tycoon/builder** that runs in the browser on page load. The player lays track
+at runtime across procedurally-generated terrain, pays a terrain-dependent build cost, bulldozes
+obstacles, releases **colored trains that must reach the city of their matching color**, earns income from
+cargo carriages, and races a **year clock** while **new towns are founded over time**. Trains can
+**crash** if the player mismanages switches — a punishing, explicit consequence, not physics.
 
-Recommended package layout:
+### Stack
 
-```text
-com.yourgame
-  GameApp
-  platform/
-    LeaderboardService
-    HttpLeaderboardService
-    JsonCodec
-  screen/
-    LoadingScreen
-    MainMenuScreen
-    LevelSelectScreen
-    GameplayScreen
-  asset/
-    AssetCatalog
-    GameAssets
-  world/
-    GridMap
-    Tile
-    TrackPiece
-    TrackShape
-    TrackGraph
-    TrackNode
-    TrackEdge
-    SwitchController
-  train/
-    Train
-    TrainController
-    TrainPath
-    SegmentOccupancy
-    CollisionSystem
-  level/
-    LevelData
-    LevelLoader
-  render/
-    WorldRenderer
-    TrainRenderer
-    UiRenderer
-```
+- **Core:** libGDX with **Kotlin**. All gameplay, simulation, and rendering logic lives here with no
+  platform dependencies.
+- **Web target:** **TeaVM** (`gdx-teavm` backend), **not GWT**.
+  - **Why not GWT:** GWT transpiles Java *source* and **cannot compile Kotlin**. Kotlin only emits JVM
+    bytecode. **TeaVM** compiles JVM *bytecode* → JavaScript/WebGL2, so it works with Kotlin and is the
+    modern libGDX web backend. The web launcher produces an `index.html` that boots the game when the
+    user opens the site.
+- **Desktop:** **lwjgl3** launcher — a fast dev/test harness. Identical core logic runs here for
+  deterministic unit tests without a browser.
 
-Design defaults:
+### Web-safe discipline (applies to TeaVM, carried over from GWT best practice)
 
-- Simulation in world units, rendering in pixels via camera + `FitViewport`.
-- No scene graph for gameplay entities; use plain domain objects updated by systems.
-- Level content loaded from JSON/Tiled-like custom files parsed with LibGDX `JsonReader`.
-- Asset loading staged through a dedicated `LoadingScreen`.
+- No reflection-based serialization; no native libraries (no Box2D/native physics).
+- Allocation-light: reuse `Vector2`/temp objects, prefer libGDX primitive collections
+  (`IntArray`, `IntMap`, `Array`).
+- All assets predeclared and preloaded through `AssetManager` — no runtime filesystem discovery.
+- **Determinism:** never use `Math.random()`/`System.currentTimeMillis()` in the sim. Seed a libGDX
+  `RandomXS128` and drive all procedural generation and events from it.
+- Render in WebGL2 (`useGL30 = true` equivalent in the TeaVM config).
 
-## 1. Grid & Graph System
-
-### World Model
-
-Use a tile grid as the authoring and occupancy layer, and derive a directed graph as the movement layer.
-
-```java
-public final class GridMap {
-    public final int width, height;
-    private final Tile[] tiles; // width * height
-
-    public Tile get(int x, int y) { return tiles[y * width + x]; }
-}
-```
-
-```java
-public final class Tile {
-    public final int x, y;
-    public TrackPiece track; // null for empty
-}
-```
-
-`TrackPiece` should be immutable runtime data except for switch state:
-
-```java
-public final class TrackPiece {
-    public final TrackShape shape;
-    public final byte rotation; // 0..3
-    public final int graphNodeId; // entry point for graph mapping
-    public int switchState; // only used when shape == SWITCH
-}
-```
-
-### Track Representation
-
-Represent connectivity in local tile-space using ports:
-
-```java
-public enum Port { N, E, S, W }
-public enum TrackShape {
-    STRAIGHT, CURVE, SWITCH, CROSS
-}
-```
-
-Each `TrackShape + rotation + switchState` resolves to one or more directed connections:
-
-- `STRAIGHT`: `N->S`, `S->N` or `E->W`, `W->E`
-- `CURVE`: `N->E`, `E->N`, etc.
-- `CROSS`: two independent channels, never auto-turn unless designed
-- `SWITCH`: one inbound trunk and two outbound branches; active branch selected by `switchState`
-
-### Directed Graph
-
-Build a graph from tile-local endpoints, not from tile centers. Each traversable lane is an edge between two node endpoints.
-
-```java
-public final class TrackNode {
-    public final int id;
-    public final float x, y; // world position
-    public final int tileX, tileY;
-}
-```
-
-```java
-public final class TrackEdge {
-    public final int id;
-    public final int fromNodeId;
-    public final int toNodeId;
-    public final float length;
-    public final byte laneMask; // for crossing/intersection channel identity
-    public final Curve2D curve; // line or bezier
-    public boolean enabled = true;
-}
-```
-
-```java
-public final class TrackGraph {
-    public final Array<TrackNode> nodes = new Array<>();
-    public final Array<TrackEdge> edges = new Array<>();
-    public final IntMap<IntArray> outgoingByNode = new IntMap<>();
-}
-```
-
-### Switches as Dynamic Nodes
-
-Model a switch as a controller over a small set of mutually exclusive outgoing edges.
-
-```java
-public final class SwitchController {
-    public final int nodeId;
-    public final IntArray branchEdgeIds = new IntArray(); // 2 or 3 candidates
-    public int activeIndex;
-
-    public void toggle(TrackGraph graph) {
-        activeIndex = (activeIndex + 1) % branchEdgeIds.size;
-        for (int i = 0; i < branchEdgeIds.size; i++) {
-            graph.edges.get(branchEdgeIds.get(i)).enabled = (i == activeIndex);
-        }
-    }
-}
-```
-
-Important rule:
-
-- Never mutate graph topology after load.
-- Only toggle `enabled` flags on prebuilt edges.
-
-This avoids GWT-side allocation churn and keeps pathfinding/simple occupancy stable.
-
-### Relation Sketch
+### Gradle modules
 
 ```text
-GridMap 1 -> many Tile
-Tile 0..1 -> TrackPiece
-GridMap -> TrackGraph (derived)
-TrackGraph 1 -> many TrackNode
-TrackGraph 1 -> many TrackEdge
-SwitchController -> TrackGraph.edge.enabled
+RailTheWay/
+  core/      // all Kotlin gameplay + rendering logic (no platform deps)
+  lwjgl3/    // desktop launcher — fast dev/test harness
+  teavm/     // web launcher → index.html, compiles core bytecode to JS/WebGL2
+  assets/    // shared: atlases, bitmap fonts, sfx, config json
 ```
 
-## 2. Train Movement & Pathfinding
+Generate the project with **gdx-liftoff**, selecting Kotlin and the TeaVM platform.
 
-### Movement State
-
-A train moves continuously along a current edge using scalar progress.
-
-```java
-public final class Train {
-    public int currentEdgeId;
-    public float distanceOnEdge;
-    public float speed; // world units/sec
-    public final IntArray reservedEdgeIds = new IntArray(); // future route
-    public float length;
-    public boolean blocked;
-}
-```
-
-Update loop:
-
-1. Compute `advance = speed * delta`.
-2. Move along `currentEdge.length`.
-3. If edge end reached, transition to next enabled edge from route.
-4. If no valid next edge, stop or fail level.
-
-```java
-public void updateTrain(Train train, float delta, TrackGraph graph) {
-    TrackEdge edge = graph.edges.get(train.currentEdgeId);
-    train.distanceOnEdge += train.speed * delta;
-
-    while (train.distanceOnEdge >= edge.length) {
-        train.distanceOnEdge -= edge.length;
-        int nextEdgeId = chooseNextEdge(train, edge.toNodeId, graph);
-        if (nextEdgeId < 0) {
-            train.distanceOnEdge = edge.length;
-            train.blocked = true;
-            return;
-        }
-        train.currentEdgeId = nextEdgeId;
-        edge = graph.edges.get(nextEdgeId);
-    }
-}
-```
-
-### Curves and Orientation
-
-Store geometry per edge as either:
-
-- straight segment: `p0 -> p1`
-- quadratic Bezier for curves/switch diverging arcs
-
-```java
-public interface Curve2D {
-    Vector2 positionAt(float t, Vector2 out);
-    Vector2 tangentAt(float t, Vector2 out);
-}
-```
-
-Map distance to normalized `t`:
-
-```java
-float t = train.distanceOnEdge / edge.length;
-Vector2 pos = edge.curve.positionAt(t, tmpPos);
-Vector2 tan = edge.curve.tangentAt(t, tmpTan);
-float angleDeg = MathUtils.atan2(tan.y, tan.x) * MathUtils.radiansToDegrees;
-```
-
-Guideline:
-
-- Precompute approximate `length` for bezier edges during level build.
-- Avoid allocating `Vector2`; use reusable temp vectors owned by the system/renderer.
-
-### Pathfinding
-
-Use lightweight graph search:
-
-- BFS for puzzle-like shortest hops
-- Dijkstra/A* if varying segment weights or dynamic penalties are needed
-
-Recommended route request:
-
-```java
-public interface RoutePlanner {
-    boolean findRoute(int startNodeId, int goalNodeId, IntArray outEdgeIds);
-}
-```
-
-GWT-safe notes:
-
-- Use LibGDX collections: `IntArray`, `IntMap`, `Array`
-- Reuse open/closed arrays to avoid GC spikes in browser
-
-### Collision and Reservation System
-
-Do not use physics. Use logical occupancy per edge and per protected intersection.
-
-Core idea:
-
-- Each `TrackEdge` can have at most one train reservation for a critical span.
-- Crossings expose a shared conflict zone token.
-- Train must reserve `current + next N edges` before entering.
-
-```java
-public final class SegmentOccupancy {
-    public int occupyingTrainId = -1;
-    public float reservedUntil = 0f;
-}
-```
-
-```java
-public final class CollisionSystem {
-    private final SegmentOccupancy[] edgeOcc;
-    private final SegmentOccupancy[] junctionOcc;
-
-    public boolean canEnter(int trainId, int edgeId, float now) { ... }
-    public void reserve(int trainId, int edgeId, float now, float ttl) { ... }
-    public void release(int trainId, int edgeId) { ... }
-}
-```
-
-Rules:
-
-- Straight/curve edge: reserve by edge ID
-- Crossroad/intersection: reserve a shared junction occupancy ID
-- Rear-end prevention: deny entry if another train already occupies same edge in same conflict zone
-- Head-on prevention: because graph is directed, opposing travel uses different edge IDs and can still share one conflict token when needed
-
-Recommended policy:
-
-- Train reserves next 1-2 segments before advancing through a node
-- If reservation fails, decelerate to stop at edge end
-- This gives puzzle-logic behavior without continuous collision geometry
-
-## 3. State Management & Game Loop
-
-### Screen Structure
-
-Use standard LibGDX `Game` with screen objects. Keep screens thin; actual logic lives in controllers/services.
-
-```java
-public final class GameApp extends Game {
-    public final GameAssets assets;
-    public final LeaderboardService leaderboard;
-
-    @Override
-    public void create() {
-        setScreen(new LoadingScreen(this));
-    }
-}
-```
-
-Recommended screens:
-
-- `LoadingScreen`: queues atlases/fonts/level JSON and transitions only after `AssetManager.update()`
-- `MainMenuScreen`
-- `LevelSelectScreen`
-- `GameplayScreen`
-
-### Gameplay Loop
-
-Inside `GameplayScreen`:
-
-```java
-public final class GameplayScreen implements Screen {
-    private final WorldController world;
-    private final WorldRenderer renderer;
-    private final FitViewport viewport;
-
-    public void render(float delta) {
-        float dt = Math.min(delta, 1f / 30f); // clamp for browser tab hiccups
-        world.update(dt);
-        renderer.render();
-    }
-}
-```
-
-Separate systems:
+### Core package layout (`com.railtheway`)
 
 ```text
-WorldController
-  -> InputSystem
-  -> SwitchSystem
-  -> TrainController
-  -> CollisionSystem
-  -> WinLoseSystem
+app/        GameApp, LoadingScreen, MainMenuScreen, ModeSelectScreen, GameplayScreen, GameOverScreen
+world/      GridMap, Tile, TerrainType, WorldGen
+track/      TrackGraph, TrackNode, TrackEdge, TrackPiece, TrackShape, SwitchController,
+            TrackBuilder, Curve2D
+econ/       Economy, CostModel, Clock, DifficultyMode
+town/       Town, TownSystem, FoundingEvent, CargoOrder
+train/      Train, Carriage, TrainController, RoutePlanner, Signal, CrashSystem, DeliverySystem
+input/      InputMode, ToolController, CameraController
+render/     WorldRenderer, TerrainRenderer, TrackRenderer, TrainRenderer, HudRenderer, NewspaperOverlay
+save/       SaveState, JsonCodec
 ```
 
-### Input for Switches
+### Design defaults
 
-Use camera unprojection to world coordinates, map to tile, then route clicks to `SwitchController`.
+- Simulation in world units; rendering in pixels via camera + viewport.
+- No scene graph for gameplay entities; plain Kotlin domain objects updated by systems each frame.
+- The tile grid is the authoring/occupancy/terrain layer; a **runtime-mutable** directed graph is the
+  movement layer derived from committed track.
+- The world is **larger than the viewport** — the camera pans and zooms (clamped).
 
-```java
-Vector3 p = camera.unproject(new Vector3(screenX, screenY, 0));
-int tileX = (int)(p.x / TILE_SIZE);
-int tileY = (int)(p.y / TILE_SIZE);
-```
+---
 
-### Viewports / Responsive Layout
+## 1. World & Terrain
 
-Use:
+The grid is the authoring layer for both **terrain** and **track**.
 
-- `FitViewport(worldWidth, worldHeight)` for gameplay world
-- optional second `ScreenViewport` or `FitViewport` for UI/HUD stage
+```kotlin
+enum class TerrainType { GRASS, TREES, ROCKS, WATER }   // + decorative variants
 
-Guidelines:
+class Tile(
+    val x: Int,
+    val y: Int,
+    var terrain: TerrainType = TerrainType.GRASS,
+    var track: TrackPiece? = null,                       // null when no rail on this tile
+    var townId: Int = -1,                                // station tile belongs to a town
+)
 
-- Keep gameplay coordinates fixed, e.g. `320 x 180` or tile-derived world size
-- On resize:
-
-```java
-viewport.update(width, height, true);
-uiViewport.update(width, height, true);
-```
-
-- Use CSS/browser page config only for canvas scaling; do not mix layout logic into gameplay coordinates
-
-For mobile browsers:
-
-- Larger input hit areas for switches
-- Avoid relying on hover/right-click
-- Clamp max zoom if you add camera controls
-
-## 4. Web-Compatible Leaderboard
-
-### Service Boundary
-
-Abstract transport from gameplay:
-
-```java
-public interface LeaderboardService {
-    void fetchTopScores(String levelId, ScoreListCallback callback);
-    void submitScore(ScoreEntry entry, StatusCallback callback);
+class GridMap(val width: Int, val height: Int) {
+    private val tiles = Array(width * height) { i -> Tile(i % width, i / width) }
+    fun get(x: Int, y: Int): Tile = tiles[y * width + x]
+    fun inBounds(x: Int, y: Int) = x in 0 until width && y in 0 until height
 }
 ```
 
-```java
-public interface ScoreListCallback {
-    void onSuccess(Array<ScoreEntry> scores);
-    void onError(String message);
+### Procedural generation (`WorldGen`)
+
+Deterministic from a seed (`RandomXS128`):
+
+1. Fill GRASS.
+2. Scatter **TREES** in clusters (value-noise threshold + clustered growth) — these are the forests that
+   make track expensive to clear.
+3. Scatter **ROCKS** and small **WATER** ponds/lakes (also raise build cost / block freely).
+4. Place initial **towns at the map edges** (see §6), each with a unique color, and reserve their station
+   tiles.
+
+Re-running `WorldGen` with the same seed and difficulty must produce an identical map (testable on
+desktop).
+
+---
+
+## 2. Track Network — Runtime-Mutable Graph
+
+> **Key correction from earlier drafts:** the graph is **mutable at runtime**. Construction adds nodes and
+> edges; Bulldozer and crashes remove them. (Only *switch state* uses the prebuilt-edge `enabled` toggle —
+> never the topology itself.)
+
+Track is authored as tile-snapped pieces (the screenshots show 8-direction segments rotated with
+`Q`/`W`), and a directed graph is derived from piece endpoints.
+
+```kotlin
+enum class TrackShape { STRAIGHT, CURVE, SWITCH, CROSS }
+
+class TrackPiece(
+    val shape: TrackShape,
+    val rotation: Byte,        // 0..7 for 8-direction snapping
+    var nodeId: Int,           // entry node into the graph
+    var switchState: Int = 0,  // only used when shape == SWITCH
+)
+
+class TrackNode(val id: Int, val x: Float, val y: Float, val tileX: Int, val tileY: Int)
+
+class TrackEdge(
+    val id: Int,
+    val fromNodeId: Int,
+    val toNodeId: Int,
+    val length: Float,
+    val curve: Curve2D,        // straight line or quadratic bezier
+    val tileX: Int, val tileY: Int,  // tile this edge occupies (for crash damage + bulldoze)
+    var enabled: Boolean = true,     // toggled by switches only
+)
+```
+
+```kotlin
+class TrackGraph {
+    val nodes = Array<TrackNode>()
+    val edges = Array<TrackEdge>()
+    val outgoingByNode = IntMap<IntArray>()
+    private val freeEdgeIds = IntArray()   // id reuse to keep arrays compact
+
+    fun addNode(x: Float, y: Float, tx: Int, ty: Int): Int { /* … */ }
+    fun addEdge(from: Int, to: Int, curve: Curve2D, tx: Int, ty: Int): Int { /* … */ }
+    fun removeEdge(id: Int) { /* detach from outgoing index, recycle id */ }
+    fun mergeOrCreateNodeAt(x: Float, y: Float, tx: Int, ty: Int): Int { /* junctions share a node */ }
 }
 ```
 
-### HTTP Client
+- Each lay-down of track creates/merges endpoint nodes and adds directed edges (both directions for
+  bidirectional rail).
+- Junctions form naturally when a new piece's endpoint snaps onto an existing node →
+  `mergeOrCreateNodeAt`. A node with 3+ branches becomes a **switch**.
 
-Implement using `Gdx.net.sendHttpRequest`.
+### Geometry
 
-```java
-public final class HttpLeaderboardService implements LeaderboardService {
-    private final JsonCodec json = new JsonCodec();
-    private final String baseUrl;
+```kotlin
+interface Curve2D {
+    fun positionAt(t: Float, out: Vector2): Vector2
+    fun tangentAt(t: Float, out: Vector2): Vector2
+}
+```
 
-    public void fetchTopScores(String levelId, final ScoreListCallback cb) {
-        HttpRequest req = new HttpRequest(HttpMethods.GET);
-        req.setUrl(baseUrl + "/scores?level=" + levelId);
+Straight segments and quadratic beziers (for curves). Precompute approximate `length` on build. Reuse temp
+vectors — never allocate per frame.
 
-        Gdx.net.sendHttpRequest(req, new HttpResponseListener() {
-            @Override public void handleHttpResponse(HttpResponse res) {
-                if (res.getStatus().getStatusCode() == 200) {
-                    cb.onSuccess(json.parseScoreList(res.getResultAsString()));
-                } else {
-                    cb.onError("HTTP " + res.getStatus().getStatusCode());
-                }
-            }
-            @Override public void failed(Throwable t) { cb.onError(t.getMessage()); }
-            @Override public void cancelled() { cb.onError("cancelled"); }
-        });
+### Switches as dynamic nodes
+
+```kotlin
+class SwitchController(val nodeId: Int) {
+    val branchEdgeIds = IntArray()    // 2–3 mutually exclusive outgoing edges
+    var activeIndex = 0
+
+    fun toggle(graph: TrackGraph) {
+        activeIndex = (activeIndex + 1) % branchEdgeIds.size
+        for (i in 0 until branchEdgeIds.size)
+            graph.edges.get(branchEdgeIds.get(i)).enabled = (i == activeIndex)
     }
 }
 ```
 
-### JSON Parsing
+The player flips switches in **Control mode**. Only `enabled` flags change — the prebuilt branch edges
+stay; topology is untouched by switching.
 
-Use LibGDX JSON classes only:
+---
 
-- `JsonReader`
-- `JsonValue`
-- optionally `Json` with explicit serializers, but avoid reflection-based auto-mapping
+## 3. Construction, Bulldozer & Cost Model
 
-Recommended manual codec:
+### Cost model
 
-```java
-public final class JsonCodec {
-    private final JsonReader reader = new JsonReader();
-
-    public Array<ScoreEntry> parseScoreList(String text) {
-        JsonValue root = reader.parse(text);
-        JsonValue items = root.get("scores");
-        Array<ScoreEntry> out = new Array<>();
-
-        for (JsonValue it = items.child; it != null; it = it.next) {
-            ScoreEntry e = new ScoreEntry();
-            e.player = it.getString("player");
-            e.levelId = it.getString("levelId");
-            e.score = it.getInt("score");
-            e.timeMs = it.getLong("timeMs");
-            out.add(e);
-        }
-        return out;
+```kotlin
+object CostModel {
+    fun tileBuildCost(terrain: TerrainType): Int = when (terrain) {
+        TerrainType.GRASS -> BASE          // cheap (~1000 over a short run)
+        TerrainType.TREES -> BASE + CLEAR_TREES   // forests are expensive (clearing)
+        TerrainType.ROCKS -> BASE + CLEAR_ROCKS
+        TerrainType.WATER -> BASE + BRIDGE_WATER  // lakes are the most expensive
     }
-
-    public String writeScore(ScoreEntry e) {
-        return "{\"player\":\"" + escape(e.player) + "\","
-             + "\"levelId\":\"" + escape(e.levelId) + "\","
-             + "\"score\":" + e.score + ","
-             + "\"timeMs\":" + e.timeMs + "}";
-    }
-
-    private String escape(String s) { return s.replace("\"", "\\\""); }
+    fun segmentCost(tiles: List<Tile>): Int = tiles.sumOf { tileBuildCost(it.terrain) }
 }
 ```
 
-Guidelines:
+These match the screenshots: ~1000 $ on grass, ~5000 $ for a longer run, **~12000 $ across forest**.
 
-- Prefer explicit field parsing over generic object mapping
-- Keep DTOs flat and primitive-heavy
-- Handle absent fields defensively because browser builds are harder to debug than desktop
+### `TrackBuilder` (Construction mode)
 
-## 5. Assets & Optimization
+1. Player hovers a tile-snapped ghost segment; rotate with `Q`/`W`.
+2. Compute `CostModel.segmentCost(...)` and show the **live price label** over the ghost.
+3. On click: if `Economy.canAfford(cost)` → debit, clear terrain on those tiles (TREES/ROCKS → GRASS,
+   WATER → bridged), set `Tile.track`, and mutate the `TrackGraph` (`addEdge`/`mergeOrCreateNodeAt`).
+   Otherwise reject with feedback.
 
-### Asset Pipeline
+### Bulldozer mode
 
-Use one or more `TextureAtlas` files for:
+Demolish trees, rocks, buildings, **and existing track** for a cost. Updates terrain and removes the
+corresponding graph edges/nodes (`removeEdge`). This is also how the player repairs a crash gap (rebuild
+in Construction afterward).
 
-- track tiles
-- trains
-- UI icons
-- particles/effects if any
+---
 
-Load only via `AssetManager`:
+## 4. Economy & Time
 
-```java
-assetManager.load("gfx/game.atlas", TextureAtlas.class);
-assetManager.load("levels/level_01.json", String.class);
+```kotlin
+class Economy(var balance: Int) {
+    fun canAfford(cost: Int) = balance >= cost
+    fun debit(cost: Int) { balance -= cost }
+    fun credit(amount: Int) { balance += amount }
+}
 ```
 
-Wrap lookups:
+- **Income:** completed color-matched deliveries pay out, scaled by carriage count (more carriages → more
+  money). Lost trains (crashes) forfeit their cargo.
+- **Costs:** construction, bulldozing, ordering trains ($2–4K).
 
-```java
-public final class GameAssets {
-    private final AssetManager manager;
+```kotlin
+class Clock(var year: Int, val endYear: Int) {
+    var speed = 1f                  // 1× / 2× / 0 (paused)
+    fun update(dt: Float) { /* advance fractional year by dt*speed */ }
+    val finished get() = year >= endYear
+}
+```
 
-    public TextureRegion track(String name) {
-        return manager.get("gfx/game.atlas", TextureAtlas.class).findRegion(name);
+When `Clock.finished` → transition to `GameOverScreen` with the final balance/score.
+
+---
+
+## 5. Towns & Founding Events
+
+```kotlin
+class Town(val id: Int, val color: TownColor, val tileX: Int, val tileY: Int, val stationNodeId: Int)
+```
+
+- Towns are colored, named stations placed at map edges (REDTOWN, WHITEBRIDGE, GREENHILL, …).
+- `TownSystem` founds **new towns over time** per difficulty. Each founding fires a **newspaper overlay**
+  ("Greenhill Was Founded!"), adds a station node to the `TrackGraph`, and begins issuing colored train
+  demand (`CargoOrder`).
+
+```kotlin
+class FoundingEvent(val headline: String, val year: Int, val body: String)
+```
+
+The newspaper overlay path is shared with the crash event (§7).
+
+---
+
+## 6. Trains, Cargo & Color-Matched Delivery
+
+```kotlin
+enum class TownColor { RED, WHITE, GREEN, YELLOW, BROWN, BLUE /* … */ }
+
+class Carriage(val cargo: CargoType)
+
+class Train(
+    val color: TownColor,
+    var speed: Float,
+    val carriages: Array<Carriage>,
+    var currentEdgeId: Int,
+    var distanceOnEdge: Float,
+    val route: IntArray = IntArray(),   // planned edge ids
+    var alive: Boolean = true,
+)
+```
+
+- Trains are **released from a station in Control mode** and carry colored cargo.
+- **Core rule:** a train must reach the **town whose color matches the train's color**. `DeliverySystem`
+  validates the match on arrival at a station node and pays out via `Economy.credit(...)` scaled by
+  `carriages.size`. Wrong-color arrival = no payout (and the train must be re-routed/returned).
+- **Order-train mode** buys additional trains ($2–4K); income scales with carriage count.
+
+```kotlin
+interface RoutePlanner { fun findRoute(startNodeId: Int, goalNodeId: Int, out: IntArray): Boolean }
+```
+
+BFS for the common case; Dijkstra/A* if weighted. Reuse open/closed buffers — no per-search allocation.
+
+---
+
+## 7. Movement, Switches, Routing & Crashes
+
+### Movement
+
+Port the continuous edge-progress model: advance `distanceOnEdge += speed*dt`, roll over to the next
+**enabled** outgoing edge chosen by switch state / route, derive position and angle from
+`curve.positionAt/tangentAt`. Trains **follow switch state deterministically and do not auto-stop** —
+routing is the player's responsibility (flip switches, build sidings, reverse in Control mode).
+
+### Crashes — an explicit fail consequence (confirmed by `~/Desktop/screens/crash`)
+
+Crashes are **not** prevented by physics. When two trains meet on the same edge/tile (head-on or rear-end)
+without being separated by a switch, `CrashSystem` fires:
+
+```kotlin
+class CrashSystem {
+    fun update(trains: Array<Train>, graph: TrackGraph, map: GridMap, events: EventBus) {
+        // detect two alive trains occupying the same edge/tile in conflict
+        // on collision:
+        //   1. both.alive = false              -> removed from play, cargo income lost
+        //   2. graph.removeEdge(impactEdgeId)  -> track section destroyed (gap left)
+        //      map.get(tx,ty).track = null; mark damaged/cleared terrain at impact tile
+        //   3. events.post(FoundingEvent("Terrible Train Crash!", clock.year, "...two trains went to
+        //      the same track and collided! A railroad section is damaged and vehicles are disabled."))
     }
 }
 ```
 
-### GWT-Specific Practices
+Consequences, exactly as the screenshots show:
+1. **Both trains destroyed** and removed (their cargo income lost).
+2. **Track damaged** — the edge(s) at the impact tile are deleted, leaving a **gap the player must rebuild
+   and pay for** (terrain reverts to a damaged/cleared marker).
+3. **"Terrible Train Crash!" newspaper** overlay (reuses the `FoundingEvent`/`NewspaperOverlay` path).
 
-- Predeclare all assets in `html/assets`; no runtime filesystem discovery
-- Avoid loading hundreds of tiny textures; atlas aggressively
-- Prefer bitmap fonts over dynamic font generation on web
-- Keep atlas count low to reduce texture binds
-- Reuse one `SpriteBatch` for world + UI where practical, or two phases with minimal state changes
+Any optional signal/reservation logic is a **player aid** layered on top — not a hard guarantee. The base
+game lets bad layouts crash.
 
-### Draw Call Minimization
+---
 
-- Sort rendering by atlas/texture naturally by drawing from same atlas
-- Batch all static track tiles in one pass
-- For very large maps, prebuild static track layer into a `SpriteCache` or chunked cache if compatible with your rendering needs
-- Animate only trains/signals/switch highlights as dynamic sprites
+## 8. Input Modes & Camera
 
-### Memory / Browser Stability
+```kotlin
+enum class InputMode { CONTROL, CONSTRUCTION, BULLDOZER, ORDER_TRAIN }
+```
 
-- Avoid per-frame object creation
-- Use primitive arrays / LibGDX collections
-- Keep level JSON compact
-- Dispose unused screens/assets explicitly on screen transitions
-- Clamp particle counts and avoid large framebuffers unless necessary
+`ToolController` switches modes via hotkeys **1–4** and the bottom toolbar:
 
-### Loading Flow
+- **Control [1]:** flip switches, release trains from stations, reverse train direction by clicking.
+- **Construction [2]:** lay rail; `Q`/`W` rotate the previewed piece; live price shown.
+- **Bulldozer [3]:** demolish trees/rocks/buildings/rail for a cost.
+- **Order-train [4]:** buy an extra train.
 
-`LoadingScreen` should:
+Click handling: `camera.unproject(screen)` → world → tile, then route to the active tool.
 
-1. enqueue atlas/fonts/level index
-2. render progress bar while `AssetManager.update()`
-3. instantiate `GameAssets`
-4. switch to `MainMenuScreen`
+```kotlin
+int tileX = (int)(world.x / TILE_SIZE); int tileY = (int)(world.y / TILE_SIZE);
+```
 
-This is critical for GWT because asset fetches are asynchronous and must complete before gameplay logic dereferences textures.
+`CameraController`: drag-to-pan over the large world, clamped to map bounds, with clamped zoom.
+Mobile-friendly: large hit areas for switches/toolbar, no reliance on hover/right-click.
+
+---
+
+## 9. Rendering & Assets
+
+- One or few `TextureAtlas` files: terrain tiles, track pieces, trains/carriages, towns, UI icons,
+  newspaper, effects.
+- Load only via `AssetManager`; wrap lookups in a `GameAssets` helper.
+- **Static layers** (terrain + committed track) batched in one pass / cached (`SpriteCache` or chunked);
+  only **trains, switch highlights, and price labels** animate as dynamic sprites.
+- Bitmap fonts (no runtime font generation on web).
+- Draw from the same atlas to minimize texture binds; avoid per-frame object creation.
+
+### Loading flow (`LoadingScreen`) — critical on web
+
+1. Enqueue atlases/fonts/config.
+2. Render a progress bar while `AssetManager.update()` (web fetches are async).
+3. Instantiate `GameAssets`.
+4. Switch to `MainMenuScreen`.
+
+No asset is dereferenced before loading completes.
+
+---
+
+## 10. Save/Load & Difficulty
+
+```kotlin
+enum class DifficultyMode(val endYear: Int, val townCount: Int, val trainEras: Int) {
+    EASY(1900, 4, 2), NORMAL(1960, 6, 3), HARD(2020, 8, 4)
+}
+```
+
+- Three era modes (matching the menu screenshot): end year, town count, and number of train eras differ.
+- `SaveState` serialized via a **manual `JsonCodec`** (libGDX `JsonReader`/`JsonValue`, no reflection — 
+  TeaVM-safe). Keep DTOs flat and primitive-heavy; parse defensively.
+- Optional later: an HTTP leaderboard via `Gdx.net.sendHttpRequest` behind a `LeaderboardService`
+  interface (out of MVP scope, but the boundary is reserved).
+
+---
 
 ## Public Interfaces / Key Types
 
-```java
+```kotlin
 interface Curve2D
 interface RoutePlanner
-interface LeaderboardService
-final class GridMap
-final class TrackGraph
-final class TrackEdge
-final class SwitchController
-final class Train
-final class CollisionSystem
-final class GameAssets
+class GridMap
+class TrackGraph         // mutable
+class TrackEdge
+class SwitchController
+class TrackBuilder
+object CostModel
+class Economy
+class Clock
+class TownSystem
+class Train
+class CrashSystem
+class DeliverySystem
+class ToolController
 ```
 
-## Test Plan
+---
 
-- Grid-to-graph build: every `TrackShape + rotation` emits expected nodes/edges
-- Switch toggling: only one branch is enabled and pathfinding respects the active branch
-- Train progression: movement across straight and curved edges preserves continuous position and angle
-- Reservation logic: rear-end and crossing conflicts block entry deterministically
-- Screen flow: app boots through `LoadingScreen` before any asset-dependent screen
-- Resize behavior: gameplay remains letterboxed and consistent under wide/tall browser sizes
-- Leaderboard client: success, non-200, timeout/cancel paths parse and report correctly
-- Web sanity: no reflection-only libs, no Box2D/native dependencies, all assets declared and preloaded
+## Screen / State Flow
+
+```text
+GameApp (libGDX Game)
+  -> LoadingScreen   (preload assets, web-critical)
+  -> MainMenuScreen
+  -> ModeSelectScreen (Easy / Normal / Hard)
+  -> GameplayScreen
+       WorldController.update(dt):
+         Input/ToolController -> SwitchSystem -> TrainController -> CrashSystem
+         -> DeliverySystem -> TownSystem -> Economy/Clock -> WinLose
+       WorldRenderer.render()
+  -> GameOverScreen  (when Clock.finished)
+```
+
+`GameplayScreen.render` clamps `dt = min(delta, 1f/30f)` for browser tab hiccups, updates the world, then
+renders.
+
+---
+
+## Test Plan (desktop / lwjgl3 harness)
+
+- **WorldGen determinism:** same seed + difficulty → identical terrain and town placement.
+- **Cost model:** grass/trees/rocks/water tiles produce expected per-segment prices.
+- **Mutable graph:** `addEdge`/`removeEdge`/`mergeOrCreateNodeAt` keep `outgoingByNode` consistent; ids
+  recycle correctly.
+- **Construction:** affordable segment commits (debits, clears terrain, adds edges); unaffordable rejects.
+- **Switch toggling:** exactly one branch enabled; routing respects the active branch.
+- **Train progression:** continuous position/angle across straight and curved edges.
+- **Delivery color-match:** matching-color arrival pays out scaled by carriages; wrong color does not.
+- **Crash:** two trains on the same edge → both destroyed, impact edge removed (gap), newspaper posted.
+- **Clock/end:** year advances at speed; reaching `endYear` triggers `GameOverScreen`.
+- **Web smoke build (TeaVM):** boots through `LoadingScreen` and launches in a browser on page load.
+- **Web sanity:** no reflection serialization, no native/Box2D, all assets predeclared, deterministic RNG.
+
+---
 
 ## Assumptions
 
-- Levels are puzzle-sized, so single-threaded pathfinding and reservation checks per frame are sufficient.
-- Switches are player-clicked discrete state changes, not analog junction simulation.
-- Trains follow track edges exactly; derailment is a game-rule outcome, not a physics simulation.
-- Leaderboard payloads are small and can be parsed fully in memory.
-- Web target is modern browsers with WebGL 2 enabled through `GwtApplicationConfiguration.useGL30 = true`.
+- Maps are tycoon-sized; single-threaded per-frame sim (pathfinding, crash checks, delivery) is
+  sufficient.
+- Track is tile-snapped (8-direction pieces rotated with `Q`/`W`), not free-angle.
+- Switches are player-toggled discrete states; trains do not self-route to avoid collisions — **crashes
+  are an intended fail consequence** the player manages.
+- The web build uses **TeaVM** (Kotlin-compatible), not GWT, on WebGL2-capable modern browsers.
+- Leaderboard/online features are deferred; the in-game economy (money, year, deliveries) is the scoring
+  system.
+```
