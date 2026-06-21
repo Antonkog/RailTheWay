@@ -1,0 +1,587 @@
+# LibGDX + GWT Architecture for a 2D Railway Puzzle Game
+
+## Summary
+
+Target a strict split between `core` gameplay logic and `html` bootstrap only. Keep all simulation deterministic, allocation-light, and free of reflection/native dependencies so the same code runs unchanged on desktop test harnesses and GWT/WebGL 2 (`useGL30 = true`).
+
+Recommended package layout:
+
+```text
+com.yourgame
+  GameApp
+  platform/
+    LeaderboardService
+    HttpLeaderboardService
+    JsonCodec
+  screen/
+    LoadingScreen
+    MainMenuScreen
+    LevelSelectScreen
+    GameplayScreen
+  asset/
+    AssetCatalog
+    GameAssets
+  world/
+    GridMap
+    Tile
+    TrackPiece
+    TrackShape
+    TrackGraph
+    TrackNode
+    TrackEdge
+    SwitchController
+  train/
+    Train
+    TrainController
+    TrainPath
+    SegmentOccupancy
+    CollisionSystem
+  level/
+    LevelData
+    LevelLoader
+  render/
+    WorldRenderer
+    TrainRenderer
+    UiRenderer
+```
+
+Design defaults:
+
+- Simulation in world units, rendering in pixels via camera + `FitViewport`.
+- No scene graph for gameplay entities; use plain domain objects updated by systems.
+- Level content loaded from JSON/Tiled-like custom files parsed with LibGDX `JsonReader`.
+- Asset loading staged through a dedicated `LoadingScreen`.
+
+## 1. Grid & Graph System
+
+### World Model
+
+Use a tile grid as the authoring and occupancy layer, and derive a directed graph as the movement layer.
+
+```java
+public final class GridMap {
+    public final int width, height;
+    private final Tile[] tiles; // width * height
+
+    public Tile get(int x, int y) { return tiles[y * width + x]; }
+}
+```
+
+```java
+public final class Tile {
+    public final int x, y;
+    public TrackPiece track; // null for empty
+}
+```
+
+`TrackPiece` should be immutable runtime data except for switch state:
+
+```java
+public final class TrackPiece {
+    public final TrackShape shape;
+    public final byte rotation; // 0..3
+    public final int graphNodeId; // entry point for graph mapping
+    public int switchState; // only used when shape == SWITCH
+}
+```
+
+### Track Representation
+
+Represent connectivity in local tile-space using ports:
+
+```java
+public enum Port { N, E, S, W }
+public enum TrackShape {
+    STRAIGHT, CURVE, SWITCH, CROSS
+}
+```
+
+Each `TrackShape + rotation + switchState` resolves to one or more directed connections:
+
+- `STRAIGHT`: `N->S`, `S->N` or `E->W`, `W->E`
+- `CURVE`: `N->E`, `E->N`, etc.
+- `CROSS`: two independent channels, never auto-turn unless designed
+- `SWITCH`: one inbound trunk and two outbound branches; active branch selected by `switchState`
+
+### Directed Graph
+
+Build a graph from tile-local endpoints, not from tile centers. Each traversable lane is an edge between two node endpoints.
+
+```java
+public final class TrackNode {
+    public final int id;
+    public final float x, y; // world position
+    public final int tileX, tileY;
+}
+```
+
+```java
+public final class TrackEdge {
+    public final int id;
+    public final int fromNodeId;
+    public final int toNodeId;
+    public final float length;
+    public final byte laneMask; // for crossing/intersection channel identity
+    public final Curve2D curve; // line or bezier
+    public boolean enabled = true;
+}
+```
+
+```java
+public final class TrackGraph {
+    public final Array<TrackNode> nodes = new Array<>();
+    public final Array<TrackEdge> edges = new Array<>();
+    public final IntMap<IntArray> outgoingByNode = new IntMap<>();
+}
+```
+
+### Switches as Dynamic Nodes
+
+Model a switch as a controller over a small set of mutually exclusive outgoing edges.
+
+```java
+public final class SwitchController {
+    public final int nodeId;
+    public final IntArray branchEdgeIds = new IntArray(); // 2 or 3 candidates
+    public int activeIndex;
+
+    public void toggle(TrackGraph graph) {
+        activeIndex = (activeIndex + 1) % branchEdgeIds.size;
+        for (int i = 0; i < branchEdgeIds.size; i++) {
+            graph.edges.get(branchEdgeIds.get(i)).enabled = (i == activeIndex);
+        }
+    }
+}
+```
+
+Important rule:
+
+- Never mutate graph topology after load.
+- Only toggle `enabled` flags on prebuilt edges.
+
+This avoids GWT-side allocation churn and keeps pathfinding/simple occupancy stable.
+
+### Relation Sketch
+
+```text
+GridMap 1 -> many Tile
+Tile 0..1 -> TrackPiece
+GridMap -> TrackGraph (derived)
+TrackGraph 1 -> many TrackNode
+TrackGraph 1 -> many TrackEdge
+SwitchController -> TrackGraph.edge.enabled
+```
+
+## 2. Train Movement & Pathfinding
+
+### Movement State
+
+A train moves continuously along a current edge using scalar progress.
+
+```java
+public final class Train {
+    public int currentEdgeId;
+    public float distanceOnEdge;
+    public float speed; // world units/sec
+    public final IntArray reservedEdgeIds = new IntArray(); // future route
+    public float length;
+    public boolean blocked;
+}
+```
+
+Update loop:
+
+1. Compute `advance = speed * delta`.
+2. Move along `currentEdge.length`.
+3. If edge end reached, transition to next enabled edge from route.
+4. If no valid next edge, stop or fail level.
+
+```java
+public void updateTrain(Train train, float delta, TrackGraph graph) {
+    TrackEdge edge = graph.edges.get(train.currentEdgeId);
+    train.distanceOnEdge += train.speed * delta;
+
+    while (train.distanceOnEdge >= edge.length) {
+        train.distanceOnEdge -= edge.length;
+        int nextEdgeId = chooseNextEdge(train, edge.toNodeId, graph);
+        if (nextEdgeId < 0) {
+            train.distanceOnEdge = edge.length;
+            train.blocked = true;
+            return;
+        }
+        train.currentEdgeId = nextEdgeId;
+        edge = graph.edges.get(nextEdgeId);
+    }
+}
+```
+
+### Curves and Orientation
+
+Store geometry per edge as either:
+
+- straight segment: `p0 -> p1`
+- quadratic Bezier for curves/switch diverging arcs
+
+```java
+public interface Curve2D {
+    Vector2 positionAt(float t, Vector2 out);
+    Vector2 tangentAt(float t, Vector2 out);
+}
+```
+
+Map distance to normalized `t`:
+
+```java
+float t = train.distanceOnEdge / edge.length;
+Vector2 pos = edge.curve.positionAt(t, tmpPos);
+Vector2 tan = edge.curve.tangentAt(t, tmpTan);
+float angleDeg = MathUtils.atan2(tan.y, tan.x) * MathUtils.radiansToDegrees;
+```
+
+Guideline:
+
+- Precompute approximate `length` for bezier edges during level build.
+- Avoid allocating `Vector2`; use reusable temp vectors owned by the system/renderer.
+
+### Pathfinding
+
+Use lightweight graph search:
+
+- BFS for puzzle-like shortest hops
+- Dijkstra/A* if varying segment weights or dynamic penalties are needed
+
+Recommended route request:
+
+```java
+public interface RoutePlanner {
+    boolean findRoute(int startNodeId, int goalNodeId, IntArray outEdgeIds);
+}
+```
+
+GWT-safe notes:
+
+- Use LibGDX collections: `IntArray`, `IntMap`, `Array`
+- Reuse open/closed arrays to avoid GC spikes in browser
+
+### Collision and Reservation System
+
+Do not use physics. Use logical occupancy per edge and per protected intersection.
+
+Core idea:
+
+- Each `TrackEdge` can have at most one train reservation for a critical span.
+- Crossings expose a shared conflict zone token.
+- Train must reserve `current + next N edges` before entering.
+
+```java
+public final class SegmentOccupancy {
+    public int occupyingTrainId = -1;
+    public float reservedUntil = 0f;
+}
+```
+
+```java
+public final class CollisionSystem {
+    private final SegmentOccupancy[] edgeOcc;
+    private final SegmentOccupancy[] junctionOcc;
+
+    public boolean canEnter(int trainId, int edgeId, float now) { ... }
+    public void reserve(int trainId, int edgeId, float now, float ttl) { ... }
+    public void release(int trainId, int edgeId) { ... }
+}
+```
+
+Rules:
+
+- Straight/curve edge: reserve by edge ID
+- Crossroad/intersection: reserve a shared junction occupancy ID
+- Rear-end prevention: deny entry if another train already occupies same edge in same conflict zone
+- Head-on prevention: because graph is directed, opposing travel uses different edge IDs and can still share one conflict token when needed
+
+Recommended policy:
+
+- Train reserves next 1-2 segments before advancing through a node
+- If reservation fails, decelerate to stop at edge end
+- This gives puzzle-logic behavior without continuous collision geometry
+
+## 3. State Management & Game Loop
+
+### Screen Structure
+
+Use standard LibGDX `Game` with screen objects. Keep screens thin; actual logic lives in controllers/services.
+
+```java
+public final class GameApp extends Game {
+    public final GameAssets assets;
+    public final LeaderboardService leaderboard;
+
+    @Override
+    public void create() {
+        setScreen(new LoadingScreen(this));
+    }
+}
+```
+
+Recommended screens:
+
+- `LoadingScreen`: queues atlases/fonts/level JSON and transitions only after `AssetManager.update()`
+- `MainMenuScreen`
+- `LevelSelectScreen`
+- `GameplayScreen`
+
+### Gameplay Loop
+
+Inside `GameplayScreen`:
+
+```java
+public final class GameplayScreen implements Screen {
+    private final WorldController world;
+    private final WorldRenderer renderer;
+    private final FitViewport viewport;
+
+    public void render(float delta) {
+        float dt = Math.min(delta, 1f / 30f); // clamp for browser tab hiccups
+        world.update(dt);
+        renderer.render();
+    }
+}
+```
+
+Separate systems:
+
+```text
+WorldController
+  -> InputSystem
+  -> SwitchSystem
+  -> TrainController
+  -> CollisionSystem
+  -> WinLoseSystem
+```
+
+### Input for Switches
+
+Use camera unprojection to world coordinates, map to tile, then route clicks to `SwitchController`.
+
+```java
+Vector3 p = camera.unproject(new Vector3(screenX, screenY, 0));
+int tileX = (int)(p.x / TILE_SIZE);
+int tileY = (int)(p.y / TILE_SIZE);
+```
+
+### Viewports / Responsive Layout
+
+Use:
+
+- `FitViewport(worldWidth, worldHeight)` for gameplay world
+- optional second `ScreenViewport` or `FitViewport` for UI/HUD stage
+
+Guidelines:
+
+- Keep gameplay coordinates fixed, e.g. `320 x 180` or tile-derived world size
+- On resize:
+
+```java
+viewport.update(width, height, true);
+uiViewport.update(width, height, true);
+```
+
+- Use CSS/browser page config only for canvas scaling; do not mix layout logic into gameplay coordinates
+
+For mobile browsers:
+
+- Larger input hit areas for switches
+- Avoid relying on hover/right-click
+- Clamp max zoom if you add camera controls
+
+## 4. Web-Compatible Leaderboard
+
+### Service Boundary
+
+Abstract transport from gameplay:
+
+```java
+public interface LeaderboardService {
+    void fetchTopScores(String levelId, ScoreListCallback callback);
+    void submitScore(ScoreEntry entry, StatusCallback callback);
+}
+```
+
+```java
+public interface ScoreListCallback {
+    void onSuccess(Array<ScoreEntry> scores);
+    void onError(String message);
+}
+```
+
+### HTTP Client
+
+Implement using `Gdx.net.sendHttpRequest`.
+
+```java
+public final class HttpLeaderboardService implements LeaderboardService {
+    private final JsonCodec json = new JsonCodec();
+    private final String baseUrl;
+
+    public void fetchTopScores(String levelId, final ScoreListCallback cb) {
+        HttpRequest req = new HttpRequest(HttpMethods.GET);
+        req.setUrl(baseUrl + "/scores?level=" + levelId);
+
+        Gdx.net.sendHttpRequest(req, new HttpResponseListener() {
+            @Override public void handleHttpResponse(HttpResponse res) {
+                if (res.getStatus().getStatusCode() == 200) {
+                    cb.onSuccess(json.parseScoreList(res.getResultAsString()));
+                } else {
+                    cb.onError("HTTP " + res.getStatus().getStatusCode());
+                }
+            }
+            @Override public void failed(Throwable t) { cb.onError(t.getMessage()); }
+            @Override public void cancelled() { cb.onError("cancelled"); }
+        });
+    }
+}
+```
+
+### JSON Parsing
+
+Use LibGDX JSON classes only:
+
+- `JsonReader`
+- `JsonValue`
+- optionally `Json` with explicit serializers, but avoid reflection-based auto-mapping
+
+Recommended manual codec:
+
+```java
+public final class JsonCodec {
+    private final JsonReader reader = new JsonReader();
+
+    public Array<ScoreEntry> parseScoreList(String text) {
+        JsonValue root = reader.parse(text);
+        JsonValue items = root.get("scores");
+        Array<ScoreEntry> out = new Array<>();
+
+        for (JsonValue it = items.child; it != null; it = it.next) {
+            ScoreEntry e = new ScoreEntry();
+            e.player = it.getString("player");
+            e.levelId = it.getString("levelId");
+            e.score = it.getInt("score");
+            e.timeMs = it.getLong("timeMs");
+            out.add(e);
+        }
+        return out;
+    }
+
+    public String writeScore(ScoreEntry e) {
+        return "{\"player\":\"" + escape(e.player) + "\","
+             + "\"levelId\":\"" + escape(e.levelId) + "\","
+             + "\"score\":" + e.score + ","
+             + "\"timeMs\":" + e.timeMs + "}";
+    }
+
+    private String escape(String s) { return s.replace("\"", "\\\""); }
+}
+```
+
+Guidelines:
+
+- Prefer explicit field parsing over generic object mapping
+- Keep DTOs flat and primitive-heavy
+- Handle absent fields defensively because browser builds are harder to debug than desktop
+
+## 5. Assets & Optimization
+
+### Asset Pipeline
+
+Use one or more `TextureAtlas` files for:
+
+- track tiles
+- trains
+- UI icons
+- particles/effects if any
+
+Load only via `AssetManager`:
+
+```java
+assetManager.load("gfx/game.atlas", TextureAtlas.class);
+assetManager.load("levels/level_01.json", String.class);
+```
+
+Wrap lookups:
+
+```java
+public final class GameAssets {
+    private final AssetManager manager;
+
+    public TextureRegion track(String name) {
+        return manager.get("gfx/game.atlas", TextureAtlas.class).findRegion(name);
+    }
+}
+```
+
+### GWT-Specific Practices
+
+- Predeclare all assets in `html/assets`; no runtime filesystem discovery
+- Avoid loading hundreds of tiny textures; atlas aggressively
+- Prefer bitmap fonts over dynamic font generation on web
+- Keep atlas count low to reduce texture binds
+- Reuse one `SpriteBatch` for world + UI where practical, or two phases with minimal state changes
+
+### Draw Call Minimization
+
+- Sort rendering by atlas/texture naturally by drawing from same atlas
+- Batch all static track tiles in one pass
+- For very large maps, prebuild static track layer into a `SpriteCache` or chunked cache if compatible with your rendering needs
+- Animate only trains/signals/switch highlights as dynamic sprites
+
+### Memory / Browser Stability
+
+- Avoid per-frame object creation
+- Use primitive arrays / LibGDX collections
+- Keep level JSON compact
+- Dispose unused screens/assets explicitly on screen transitions
+- Clamp particle counts and avoid large framebuffers unless necessary
+
+### Loading Flow
+
+`LoadingScreen` should:
+
+1. enqueue atlas/fonts/level index
+2. render progress bar while `AssetManager.update()`
+3. instantiate `GameAssets`
+4. switch to `MainMenuScreen`
+
+This is critical for GWT because asset fetches are asynchronous and must complete before gameplay logic dereferences textures.
+
+## Public Interfaces / Key Types
+
+```java
+interface Curve2D
+interface RoutePlanner
+interface LeaderboardService
+final class GridMap
+final class TrackGraph
+final class TrackEdge
+final class SwitchController
+final class Train
+final class CollisionSystem
+final class GameAssets
+```
+
+## Test Plan
+
+- Grid-to-graph build: every `TrackShape + rotation` emits expected nodes/edges
+- Switch toggling: only one branch is enabled and pathfinding respects the active branch
+- Train progression: movement across straight and curved edges preserves continuous position and angle
+- Reservation logic: rear-end and crossing conflicts block entry deterministically
+- Screen flow: app boots through `LoadingScreen` before any asset-dependent screen
+- Resize behavior: gameplay remains letterboxed and consistent under wide/tall browser sizes
+- Leaderboard client: success, non-200, timeout/cancel paths parse and report correctly
+- Web sanity: no reflection-only libs, no Box2D/native dependencies, all assets declared and preloaded
+
+## Assumptions
+
+- Levels are puzzle-sized, so single-threaded pathfinding and reservation checks per frame are sufficient.
+- Switches are player-clicked discrete state changes, not analog junction simulation.
+- Trains follow track edges exactly; derailment is a game-rule outcome, not a physics simulation.
+- Leaderboard payloads are small and can be parsed fully in memory.
+- Web target is modern browsers with WebGL 2 enabled through `GwtApplicationConfiguration.useGL30 = true`.
