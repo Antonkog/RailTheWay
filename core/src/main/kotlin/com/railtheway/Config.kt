@@ -23,8 +23,9 @@ object Config {
     const val ORDER_TRAIN_COST = 3_000
     const val DELIVERY_PAYOUT = 6_000 // per carriage on a color-matched arrival
 
-    const val TRAIN_SPEED = 4.0f      // tiles / second
+    const val TRAIN_SPEED = 1.5f      // tiles / second (real time, scaled by game speed)
     const val PAN_SPEED = 600f        // world units / second
+    const val YEARS_PER_SEC = 0.5f    // game-clock rate at 1x (1 year = 2 real seconds)
 
     const val START_YEAR = 1800
     const val PADDING = 0.5f

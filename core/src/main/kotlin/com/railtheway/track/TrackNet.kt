@@ -1,92 +1,127 @@
 package com.railtheway.track
 
 import com.railtheway.world.GridMap
-import kotlin.math.abs
-import kotlin.math.max
+import com.railtheway.world.TerrainType
 
-/**
- * Runtime-mutable track layer + cost model + pathfinding, all derived from the
- * GridMap's `track` flags. Track tiles form the movement graph (8-neighbourhood);
- * a town is "connected" once a track tile is laid on its station tile.
- */
-object TrackNet {
+/** 8-direction tables. 0=E,1=NE,2=N,3=NW,4=W,5=SW,6=S,7=SE. */
+object Dirs {
+    val DX = intArrayOf(1, 1, 0, -1, -1, -1, 0, 1)
+    val DY = intArrayOf(0, 1, 1, 1, 0, -1, -1, -1)
+    fun opp(d: Int) = (d + 4) and 7
 
-    /** Tiles a straight drag from (x0,y0) to (x1,y1) would cover (Bresenham). */
-    fun lineTiles(x0: Int, y0: Int, x1: Int, y1: Int): List<Int> {
-        val out = ArrayList<Int>()
-        var x = x0; var y = y0
-        val dx = abs(x1 - x0); val dy = -abs(y1 - y0)
-        val sx = if (x0 < x1) 1 else -1; val sy = if (y0 < y1) 1 else -1
-        var err = dx + dy
-        while (true) {
-            out.add(y * 100000 + x) // packed temporarily; unpack by caller via helpers below
-            if (x == x1 && y == y1) break
-            val e2 = 2 * err
-            if (e2 >= dy) { err += dy; x += sx }
-            if (e2 <= dx) { err += dx; y += sy }
-        }
-        return out
+    /** Forward directions for the four straight-piece orientations. */
+    val AXES = intArrayOf(0, 2, 1, 3) // E (horizontal), N (vertical), NE (/), NW (\)
+    val AXIS_NAME = arrayOf("Horizontal", "Vertical", "Diagonal /", "Diagonal \\")
+
+    /** Smallest circular step distance between two directions (0..4). */
+    fun arc(a: Int, b: Int): Int {
+        val d = ((a - b) and 7)
+        return minOf(d, 8 - d)
     }
 
-    fun packX(packed: Int) = packed % 100000
-    fun packY(packed: Int) = packed / 100000
+    /** Direction from tile A to adjacent tile B, or -1 if not 8-adjacent. */
+    fun between(ax: Int, ay: Int, bx: Int, by: Int): Int {
+        val dx = bx - ax; val dy = by - ay
+        for (d in 0..7) if (DX[d] == dx && DY[d] == dy) return d
+        return -1
+    }
+}
 
-    /** Cost to build along a line; tiles that already have track are free (reuse). */
-    fun lineCost(map: GridMap, packedTiles: List<Int>): Int {
+/**
+ * Runtime-mutable track layer: 3-tile straight pieces, junctions/switches, bulldoze,
+ * all expressed as symmetric connection masks on the GridMap.
+ */
+object TrackNet {
+    private fun setBit(map: GridMap, i: Int, d: Int) {
+        map.conn[i] = (map.mask(i) or (1 shl d)).toByte()
+    }
+    private fun clearBit(map: GridMap, i: Int, d: Int) {
+        map.conn[i] = (map.mask(i) and (1 shl d).inv()).toByte()
+    }
+
+    fun connected(map: GridMap, i: Int, d: Int) = (map.mask(i) ushr d) and 1 == 1
+    fun degree(map: GridMap, i: Int) = Integer.bitCount(map.mask(i))
+
+    fun connectedDirs(map: GridMap, i: Int): IntArray {
+        val m = map.mask(i)
+        val out = ArrayList<Int>(8)
+        for (d in 0..7) if ((m ushr d) and 1 == 1) out.add(d)
+        return out.toIntArray()
+    }
+
+    /** Link tile (ax,ay) to its neighbour in direction d (symmetric). */
+    private fun link(map: GridMap, ax: Int, ay: Int, d: Int) {
+        val bx = ax + Dirs.DX[d]; val by = ay + Dirs.DY[d]
+        if (!map.inBounds(ax, ay) || !map.inBounds(bx, by)) return
+        setBit(map, map.idx(ax, ay), d)
+        setBit(map, map.idx(bx, by), Dirs.opp(d))
+    }
+
+    /** The three tile (x,y) cells a piece at center (cx,cy) along orientation index occupies. */
+    fun pieceTiles(cx: Int, cy: Int, orientation: Int): IntArray {
+        val d = Dirs.AXES[orientation]
+        val dx = Dirs.DX[d]; val dy = Dirs.DY[d]
+        return intArrayOf(cx - dx, cy - dy, cx, cy, cx + dx, cy + dy) // (x0,y0,x1,y1,x2,y2)
+    }
+
+    fun pieceValid(map: GridMap, cx: Int, cy: Int, orientation: Int): Boolean {
+        val t = pieceTiles(cx, cy, orientation)
+        return map.inBounds(t[0], t[1]) && map.inBounds(t[2], t[3]) && map.inBounds(t[4], t[5])
+    }
+
+    /** Build cost: only tiles without track yet are charged (terrain-priced). */
+    fun pieceCost(map: GridMap, cx: Int, cy: Int, orientation: Int): Int {
+        val t = pieceTiles(cx, cy, orientation)
         var sum = 0
-        for (p in packedTiles) {
-            val x = packX(p); val y = packY(p)
-            if (!map.inBounds(x, y)) continue
-            if (map.hasTrack(x, y)) continue
-            sum += map.terrainAt(x, y).buildCost
+        var k = 0
+        while (k < 6) {
+            val x = t[k]; val y = t[k + 1]
+            if (map.inBounds(x, y) && !map.hasTrack(map.idx(x, y))) sum += map.terrainAt(x, y).buildCost
+            k += 2
         }
         return sum
     }
 
-    fun commitLine(map: GridMap, packedTiles: List<Int>) {
-        for (p in packedTiles) {
-            val x = packX(p); val y = packY(p)
-            if (map.inBounds(x, y)) map.setTrack(x, y, true)
-        }
+    /** Place the piece: link the three tiles and auto-extend onto abutting track. */
+    fun placePiece(map: GridMap, cx: Int, cy: Int, orientation: Int) {
+        val d = Dirs.AXES[orientation]
+        val t = pieceTiles(cx, cy, orientation)
+        val x0 = t[0]; val y0 = t[1]; val x1 = t[2]; val y1 = t[3]; val x2 = t[4]; val y2 = t[5]
+        link(map, x0, y0, d) // t0 -> t1
+        link(map, x1, y1, d) // t1 -> t2
+        // extend backward off t0 and forward off t2 if they abut existing track
+        val bx = x0 - Dirs.DX[d]; val by = y0 - Dirs.DY[d]
+        if (map.hasTrack(bx, by)) link(map, bx, by, d)
+        val fx = x2 + Dirs.DX[d]; val fy = y2 + Dirs.DY[d]
+        if (map.hasTrack(fx, fy)) link(map, x2, y2, d)
     }
 
-    private val NEI_X = intArrayOf(1, -1, 0, 0, 1, 1, -1, -1)
-    private val NEI_Y = intArrayOf(0, 0, 1, -1, 1, -1, 1, -1)
+    /** Cycle a junction's switch preference to the next connected direction. */
+    fun cycleSwitch(map: GridMap, i: Int) {
+        val dirs = connectedDirs(map, i)
+        if (dirs.size < 3) return
+        val cur = map.switchPref[i]
+        val pos = dirs.indexOf(cur)
+        map.switchPref[i] = dirs[(pos + 1) % dirs.size]
+    }
 
-    /**
-     * BFS shortest path over track tiles from src tile-index to dst tile-index.
-     * Returns the path as a list of tile indices (inclusive of both ends), or null.
-     */
-    fun findPath(map: GridMap, srcIdx: Int, dstIdx: Int): IntArray? {
-        if (!map.track[srcIdx] || !map.track[dstIdx]) return null
-        val w = map.width
-        val prev = IntArray(map.width * map.height) { -2 }
-        val queue = ArrayDeque<Int>()
-        queue.addLast(srcIdx)
-        prev[srcIdx] = -1
-        while (queue.isNotEmpty()) {
-            val cur = queue.removeFirst()
-            if (cur == dstIdx) return rebuild(prev, dstIdx)
-            val cx = cur % w; val cy = cur / w
-            for (k in NEI_X.indices) {
-                val nx = cx + NEI_X[k]; val ny = cy + NEI_Y[k]
-                if (!map.inBounds(nx, ny)) continue
-                val ni = map.idx(nx, ny)
-                if (!map.track[ni] || prev[ni] != -2) continue
-                prev[ni] = cur
-                queue.addLast(ni)
+    /** Remove all track on a tile (and the matching bits on its neighbours); else clear terrain. */
+    fun bulldoze(map: GridMap, x: Int, y: Int): Boolean {
+        if (!map.inBounds(x, y)) return false
+        val i = map.idx(x, y)
+        if (map.hasTrack(i)) {
+            for (d in 0..7) if (connected(map, i, d)) {
+                val nx = x + Dirs.DX[d]; val ny = y + Dirs.DY[d]
+                if (map.inBounds(nx, ny)) clearBit(map, map.idx(nx, ny), Dirs.opp(d))
             }
+            map.conn[i] = 0
+            map.switchPref[i] = -1
+            return true
         }
-        return null
+        if (map.terrainAt(x, y) != TerrainType.GRASS) {
+            map.terrain[i] = TerrainType.GRASS
+            return true
+        }
+        return false
     }
-
-    private fun rebuild(prev: IntArray, dst: Int): IntArray {
-        val rev = ArrayList<Int>()
-        var c = dst
-        while (c != -1) { rev.add(c); c = prev[c] }
-        rev.reverse()
-        return rev.toIntArray()
-    }
-
-    fun maxAxisDistance(x0: Int, y0: Int, x1: Int, y1: Int) = max(abs(x1 - x0), abs(y1 - y0))
 }

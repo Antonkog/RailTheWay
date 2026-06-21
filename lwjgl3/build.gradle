@@ -9,6 +9,16 @@ dependencies {
     implementation "com.badlogicgames.gdx:gdx-platform:$gdxVersion:natives-desktop"
 }
 
+// Put the shared assets/ on the runtime classpath so Gdx.files.internal("sprites/..")
+// resolves on desktop (classpath fallback), for both `run` and a packaged jar.
+sourceSets {
+    main {
+        resources {
+            srcDir rootProject.file('assets')
+        }
+    }
+}
+
 java {
     sourceCompatibility = JavaVersion.VERSION_17
     targetCompatibility = JavaVersion.VERSION_17
@@ -22,6 +32,15 @@ tasks.withType(org.jetbrains.kotlin.gradle.tasks.KotlinCompile).configureEach {
 
 application {
     mainClass = 'com.railtheway.lwjgl3.DesktopLauncherKt'
+}
+
+// Generate the 2D sprite set into <repo>/assets/sprites (headless, no display).
+tasks.register('genSprites', JavaExec) {
+    group = 'build'
+    description = 'Generate 2D directional sprites into assets/sprites.'
+    mainClass = 'com.railtheway.lwjgl3.SpriteGenKt'
+    classpath = sourceSets.main.runtimeClasspath
+    workingDir = rootProject.projectDir
 }
 
 // Headless logic smoke test (no display needed).

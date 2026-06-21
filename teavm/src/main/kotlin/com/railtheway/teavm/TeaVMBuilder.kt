@@ -1,5 +1,6 @@
 package com.railtheway.teavm
 
+import com.github.xpenatan.gdx.backends.teavm.config.AssetFileHandle
 import com.github.xpenatan.gdx.backends.teavm.config.TeaBuildConfiguration
 import com.github.xpenatan.gdx.backends.teavm.config.TeaBuilder
 import org.teavm.tooling.TeaVMTargetType
@@ -13,6 +14,7 @@ import java.io.File
 fun main() {
     val build = TeaBuildConfiguration()
     build.webappPath = File("build/dist").canonicalPath
+    build.assetsPath.add(AssetFileHandle("../assets")) // bundle sprites/ into the web build
     build.htmlTitle = "Rail The Way"
     build.htmlWidth = 960
     build.htmlHeight = 600
