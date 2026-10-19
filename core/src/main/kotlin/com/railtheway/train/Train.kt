@@ -4,8 +4,9 @@ import com.railtheway.town.TownColor
 
 /**
  * A train travelling the track graph. State is the directed edge it occupies:
- * fromTile -> toTile, with `t` the 0..1 progress along it. It follows switches at
- * junctions and must reach the town whose colour matches `color`.
+ * fromTile -> toTile, with `t` the 0..1 progress along it. It follows the paired
+ * route of a junction (reversing when its branch is closed) and must reach the town
+ * whose colour matches `color`.
  */
 class Train(
     val color: TownColor,

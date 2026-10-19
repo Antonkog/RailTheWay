@@ -115,7 +115,7 @@ class RailGame : ApplicationAdapter() {
         mode = Mode.CONSTRUCTION; orientation = 0
         rng = RandomXS128(99L + d.ordinal.toLong())
         worldCam.position.set(Config.VIEW_W / 2f, Config.VIEW_H / 2f, 0f)
-        banner = "Year $year - build 3-tile track [2] (Q/E rotate). Trains depart on their own; switch junctions [1] to route them home."
+        banner = "Year $year - build 3-tile track [2] (Q/E rotate). Trains depart on their own; switch junctions [1] (white = open route, red = closed branch)."
         bannerTimer = 8f
         state = GameState.PLAY
     }
@@ -239,8 +239,9 @@ class RailGame : ApplicationAdapter() {
         val others = towns.filter { it.id != src.id }
         if (others.isEmpty()) return false
         val dest = others[rng.nextInt(others.size)]
-        val pref = map.switchPref[ti]
-        val d = if (pref >= 0 && dirs.contains(pref)) pref else dirs[0]
+        // Leave along an open route when the station is itself a junction.
+        val route = TrackNet.activeRoute(map, ti)
+        val d = dirs.firstOrNull { TrackNet.partnerOf(route, it) >= 0 } ?: dirs[0]
         val nb = map.idx(src.tileX + Dirs.DX[d], src.tileY + Dirs.DY[d])
         trains.add(Train(dest.color, dest.id, carriages, fromTile = ti, toTile = nb))
         showToast("${dest.color.display} train left ${src.name} -> heading to ${dest.name}")
@@ -250,12 +251,13 @@ class RailGame : ApplicationAdapter() {
     private fun controlClick(tx: Int, ty: Int) {
         if (!map.inBounds(tx, ty)) return
         val tile = map.idx(tx, ty)
+        // Switches win over train reversal so a junction can always be changed.
+        if (TrackNet.degree(map, tile) >= 3) {
+            showToast(if (TrackNet.cycleSwitch(map, tile)) "Switch set" else "Junction is fixed")
+            return
+        }
         val tr = trains.firstOrNull { it.alive && it.occupantTile() == tile }
         if (tr != null) { tr.reverse(); showToast("Train reversed"); return }
-        if (TrackNet.degree(map, tile) >= 3) {
-            TrackNet.cycleSwitch(map, tile)
-            showToast("Switch set"); return
-        }
         val town = townAtTile(tile)
         if (town != null) spawnTrain(town, carriages = 1)
     }
@@ -365,13 +367,17 @@ class RailGame : ApplicationAdapter() {
         for (y in 0 until map.height) for (x in 0 until map.width) {
             batch.draw(terrainSprite(map.terrainAt(x, y)), x * t, y * t, t, t)
         }
-        // track: a half-edge sprite rotated toward each connected direction (dir d == d*45 deg)
+        // track: a half-edge sprite rotated toward each connected direction (dir d == d*45 deg).
+        // The sprite is a half tile (center -> edge midpoint). A diagonal neighbour is
+        // sqrt(2) away, so stretch diagonal halves along their local x by sqrt(2) to
+        // reach the shared tile corner instead of leaving a gap at the tile boundary.
         val half = region["rail_half_e"]!!
         for (i in 0 until map.width * map.height) {
             if (!map.hasTrack(i)) continue
             val bx = (i % map.width) * t; val by = (i / map.width) * t
             for (d in 0..7) if (TrackNet.connected(map, i, d)) {
-                batch.draw(half, bx, by, t / 2f, t / 2f, t, t, 1f, 1f, d * 45f)
+                val sx = if ((d and 1) == 1) DIAGONAL_SCALE else 1f
+                batch.draw(half, bx, by, t / 2f, t / 2f, t, t, sx, 1f, d * 45f)
             }
         }
         // towns (white body tinted to town colour) + name label
@@ -420,10 +426,26 @@ class RailGame : ApplicationAdapter() {
             if (TrackNet.degree(map, i) < 3) continue
             val cx = map.centerX(i % map.width); val cy = map.centerY(i / map.width)
             shape.color = SWITCH_COLOR; shape.circle(cx, cy, t * 0.20f, 12)
-            val pref = map.switchPref[i]
-            if (pref >= 0) {
-                shape.color = SWITCH_SET
-                shape.rectLine(cx, cy, cx + Dirs.DX[pref] * t * 0.42f, cy + Dirs.DY[pref] * t * 0.42f, t * 0.11f)
+            val route = TrackNet.activeRoute(map, i)
+            // Active route(s): white half-lines from the center to each paired direction.
+            shape.color = SWITCH_SET
+            for (d in 0..7) {
+                val p = TrackNet.partnerOf(route, d)
+                if (p > d) {
+                    shape.rectLine(cx, cy, cx + Dirs.DX[d] * t * 0.42f, cy + Dirs.DY[d] * t * 0.42f, t * 0.11f)
+                    shape.rectLine(cx, cy, cx + Dirs.DX[p] * t * 0.42f, cy + Dirs.DY[p] * t * 0.42f, t * 0.11f)
+                }
+            }
+            // Connected but unpaired branches are closed: short red stubs.
+            shape.color = SWITCH_CLOSED
+            for (d in 0..7) {
+                if (!TrackNet.connected(map, i, d)) continue
+                if (TrackNet.partnerOf(route, d) >= 0) continue
+                shape.rectLine(
+                    cx, cy,
+                    cx + Dirs.DX[d] * t * 0.28f, cy + Dirs.DY[d] * t * 0.28f,
+                    t * 0.08f,
+                )
             }
         }
         if (mode == Mode.CONSTRUCTION) {
@@ -462,7 +484,7 @@ class RailGame : ApplicationAdapter() {
         font.draw(batch, if (paused) "PAUSED" else "Speed ${speed.toInt()}x", 340f, top)
         font.draw(batch, "Mode: ${mode.label}", 470f, top)
         if (mode == Mode.CONSTRUCTION) font.draw(batch, "Piece: ${Dirs.AXIS_NAME[orientation]}  (Q/E rotate)", 640f, top)
-        font.draw(batch, "[1]Control(reverse train / set switch / send) [2]Build [3]Bulldoze [4]Order  Space:pause Tab:speed WASD:pan", 12f, 24f)
+        font.draw(batch, "[1]Control(switch / reverse train / send) [2]Build [3]Bulldoze [4]Order  Space:pause Tab:speed WASD:pan", 12f, 24f)
 
         if (bannerTimer > 0f && banner.isNotEmpty()) {
             layout.setText(font, banner); font.color = Color.YELLOW
@@ -514,8 +536,10 @@ class RailGame : ApplicationAdapter() {
     }
 
     companion object {
+        private const val DIAGONAL_SCALE = 1.41421356f
         private val SWITCH_COLOR = Color(0.95f, 0.85f, 0.25f, 0.9f)
         private val SWITCH_SET = Color(1f, 1f, 1f, 0.9f)
+        private val SWITCH_CLOSED = Color(0.95f, 0.30f, 0.25f, 0.85f)
         private val PREVIEW_OK = Color(1f, 1f, 1f, 0.45f)
         private val PREVIEW_BAD = Color(1f, 0.2f, 0.2f, 0.5f)
     }

@@ -15,9 +15,16 @@ See `architecture-plan.md` for the full design.
 - Two trains meeting on the same track **crash** — both are destroyed and the rail section is damaged.
 - Race the year clock; your final balance is your score.
 
+### Switches
+
+Junctions (3 or 4 connected directions) are switches. The white line through a junction is the open
+route; a short red stub marks a closed branch. In Control mode, click the junction to cycle routes.
+A train that reaches a junction along a closed branch cannot pass and reverses. A 4-way crossing pairs
+all four branches (straight through, or one of two crossovers).
+
 ### Controls
 
-- `1` Control (release trains from a town) · `2` Construction (drag to lay track) ·
+- `1` Control (switch junctions, send trains from a town, reverse a train) · `2` Construction (drag to lay track) ·
   `3` Bulldozer (remove track/clear terrain) · `4` Order Train (paid, 3 carriages)
 - `WASD` / arrows: pan camera · `Space`: pause · `Tab`: toggle 1×/2× speed · `Esc`: menu
 

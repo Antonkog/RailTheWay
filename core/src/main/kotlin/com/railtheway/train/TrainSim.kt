@@ -7,9 +7,9 @@ import com.railtheway.world.GridMap
 
 /**
  * GL-free train movement so it can be unit-tested headlessly. Advances a train along
- * its edge; at each tile it picks the exit deterministically (straight-through, or the
- * junction's switched direction), reverses at dead ends, and reports a colour-matched
- * delivery when the train reaches its matching town.
+ * its edge; at each tile it follows the junction's paired route (and reverses when its
+ * branch is closed), reverses at dead ends, and reports a colour-matched delivery when
+ * the train reaches its matching town.
  */
 object TrainSim {
     enum class Result { MOVING, DELIVERED }
@@ -60,19 +60,14 @@ object TrainSim {
     /** Pick the outgoing direction at tile b, having arrived from direction backDir. */
     private fun chooseExit(map: GridMap, b: Int, backDir: Int): Int {
         val dirs = TrackNet.connectedDirs(map, b)
-        var first = -1; var count = 0
-        for (d in dirs) if (d != backDir) { count++; if (first < 0) first = d }
-        if (count == 0) return -1
-        if (count == 1) return first
-        // junction: honour the switch if it points at a valid exit, else go straightest.
-        val pref = map.switchPref[b]
-        if (pref >= 0 && pref != backDir && dirs.contains(pref)) return pref
-        val travelDir = Dirs.opp(backDir)
-        var best = first; var bestArc = Int.MAX_VALUE
-        for (d in dirs) if (d != backDir) {
-            val arc = Dirs.arc(d, travelDir)
-            if (arc < bestArc) { bestArc = arc; best = d }
+        if (dirs.size < 3) {
+            // Plain track / dead end: the only other connection, or reverse.
+            var first = -1; var count = 0
+            for (d in dirs) if (d != backDir) { count++; if (first < 0) first = d }
+            return if (count == 0) -1 else first
         }
-        return best
+        // Junction/crossing: only the direction paired with the arrival is open.
+        // An unpaired (closed) branch returns -1, so the train reverses.
+        return TrackNet.partnerOf(TrackNet.activeRoute(map, b), backDir)
     }
 }

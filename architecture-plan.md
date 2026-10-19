@@ -186,6 +186,13 @@ class SwitchController(val nodeId: Int) {
 The player flips switches in **Control mode**. Only `enabled` flags change — the prebuilt branch edges
 stay; topology is untouched by switching.
 
+> **Implementation note (current MVP):** the code does not build the `TrackGraph`/`SwitchController`
+> layout above. Track is a per-tile 8-direction connection mask, and a junction's switch state is a
+> matching of its connected directions packed into `GridMap.switchRoute` as 4-bit partner codes.
+> A degree-3 tile pairs two branches and leaves one closed; a degree-4 tile pairs all four (straight
+> crossing or crossover); degree-5+ tiles use one fixed straightest matching. A train may leave a
+> junction only along the direction paired with its arrival, so a closed branch reverses it.
+
 ---
 
 ## 3. Construction, Bulldozer & Cost Model
